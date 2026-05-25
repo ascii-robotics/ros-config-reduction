@@ -1,0 +1,13 @@
+[package]
+name = "reachpy-config"
+version = "0.1.0"
+edition = "2021"
+description = "Centralized config system for ReachPy — parses, validates, and resolves reach.toml"
+
+[dependencies]
+toml = "=0.5.11"
+serde = { version = "=1.0.197", features = ["derive"] }
+thiserror = "=1.0.58"
+
+[dev-dependencies]
+tempfile = "=3.10.1"

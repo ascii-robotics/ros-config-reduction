@@ -1,0 +1,15 @@
+[package]
+name = "reach-cli"
+version = "0.1.0"
+edition = "2021"
+description = "The reach CLI — reach create, reach dev, reach run, reach build"
+
+[[bin]]
+name = "reach"
+path = "src/main.rs"
+
+[dependencies]
+reachpy-config = { path = "../reachpy-config" }
+colored = "=2.1.0"
+toml = "=0.5.11"
+serde = { version = "=1.0.197", features = ["derive"] }

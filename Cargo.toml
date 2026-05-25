@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/reachpy-config",
+    "crates/reach-cli",
+]
+resolver = "2"
