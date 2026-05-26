@@ -13,3 +13,4 @@ reachpy-config = { path = "../reachpy-config" }
 colored = "=2.1.0"
 toml = "=0.5.11"
 serde = { version = "=1.0.197", features = ["derive"] }
+ctrlc = "=3.4.2"
