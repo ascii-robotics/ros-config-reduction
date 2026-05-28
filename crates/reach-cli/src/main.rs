@@ -35,7 +35,7 @@ fn print_help() {
     println!("  {}  {}  {}", "reach run".cyan().bold(), "<profile|node...>".white(),         "Run a profile or specific nodes".dimmed());
     println!("  {}  {}  {}", "reach launch".cyan().bold(), "<pipeline>".white(),             "Run a named launch pipeline".dimmed());
     println!("  {}          {}", "reach build".cyan().bold(),                                "coming soon".dimmed());
-    println!("  {}         {}", "reach doctor".cyan().bold(),                                "coming soon".dimmed());
+    println!("  {}         {}", "reach doctor".cyan().bold(), "Diagnose workspace issues".dimmed());
     println!();
 }
 
@@ -623,7 +623,7 @@ fn main() {
             }
         }
         Some("build")  => cmd_coming_soon("build"),
-        Some("doctor") => cmd_coming_soon("doctor"),
+        Some("doctor") => cmd_doctor(),
         Some(unknown)  => {
             eprintln!("  {} Unknown command \"{}\". Run {} for help.",
                 "✗".red().bold(), unknown, "reach".cyan());
@@ -631,6 +631,281 @@ fn main() {
         }
         None => print_help(),
     }
+}
+
+fn cmd_doctor() {
+    println!();
+    println!("  {} {}", "reach doctor".white().bold(), "— diagnosing workspace...".dimmed());
+    println!();
+    println!("  {}", "─".repeat(44).dimmed());
+    println!();
+
+    let mut issues: u32 = 0;
+    let mut warnings: u32 = 0;
+
+    // ── ROS2 ─────────────────────────────────────────────────────────────────
+    println!("  {}", "ROS2".white().bold());
+
+    // Check AMENT_PREFIX_PATH
+    let ament = std::env::var("AMENT_PREFIX_PATH").unwrap_or_default();
+    if ament.is_empty() {
+        println!("  {} ROS2 is not sourced", "✗".red().bold());
+        println!("    Try: {}", "source /opt/ros/humble/setup.bash".cyan());
+        issues += 1;
+    } else {
+        // Detect distro from path
+        let distro = detect_ros2_distro(&ament);
+        println!("  {} ROS2 {} sourced", "✓".green().bold(), distro.white().bold());
+    }
+
+    // Check rclpy importable
+    let rclpy_check = Command::new("python3")
+        .arg("-c")
+        .arg("import rclpy; print(rclpy.__file__)")
+        .output();
+    match rclpy_check {
+        Ok(out) if out.status.success() => {
+            println!("  {} rclpy importable", "✓".green().bold());
+        }
+        _ => {
+            println!("  {} rclpy not importable — ROS2 may not be sourced", "✗".red().bold());
+            issues += 1;
+        }
+    }
+
+    // Check ros2 CLI available
+    let ros2_cli = Command::new("ros2").arg("--version").output();
+    match ros2_cli {
+        Ok(out) if out.status.success() => {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!("  {} ros2 CLI available  {}", "✓".green().bold(), ver.dimmed());
+        }
+        _ => {
+            println!("  {} ros2 CLI not found on PATH", "⚠".yellow().bold());
+            warnings += 1;
+        }
+    }
+
+    println!();
+
+    // ── Python ───────────────────────────────────────────────────────────────
+    println!("  {}", "Python".white().bold());
+
+    let python_check = Command::new("python3").arg("--version").output();
+    match python_check {
+        Ok(out) if out.status.success() => {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!("  {} {} on PATH", "✓".green().bold(), ver.white());
+
+            // Check against reach.toml version if available
+            if let Ok(config) = ReachConfig::load() {
+                let toml_ver = &config.project.python;
+                let sys_ver = ver.replace("Python ", "");
+                if !sys_ver.starts_with(toml_ver.trim_end_matches(".0")) {
+                    println!(
+                        "  {} system Python {} vs reach.toml python = \"{}\"",
+                        "⚠".yellow().bold(),
+                        sys_ver.white(),
+                        toml_ver.yellow()
+                    );
+                    warnings += 1;
+                }
+            }
+        }
+        _ => {
+            println!("  {} python3 not found on PATH", "✗".red().bold());
+            issues += 1;
+        }
+    }
+
+    println!();
+
+    // ── Workspace ────────────────────────────────────────────────────────────
+    println!("  {}", "Workspace".white().bold());
+
+    let config = match ReachConfig::load() {
+        Ok(c) => {
+            println!("  {} reach.toml valid", "✓".green().bold());
+            println!(
+                "    {} {}  {} {}",
+                "project:".dimmed(), c.project.name.white(),
+                "version:".dimmed(), c.project.version.white()
+            );
+            Some(c)
+        }
+        Err(ConfigError::NotFound) => {
+            println!("  {} No reach.toml found — not inside a ReachPy workspace", "✗".red().bold());
+            println!("    Run {} to create one.", "reach create <name>".cyan());
+            issues += 1;
+            None
+        }
+        Err(e) => {
+            println!("  {} reach.toml invalid:", "✗".red().bold());
+            for line in e.to_string().lines() {
+                println!("    {}", line.red());
+            }
+            issues += 1;
+            None
+        }
+    };
+
+    if let Some(ref config) = config {
+        println!();
+
+        // ── Nodes ─────────────────────────────────────────────────────────
+        println!("  {}", "Nodes".white().bold());
+
+        for (name, node) in &config.nodes {
+            if !node.script.exists() {
+                println!("  {} [{}] script not found: {}", "✗".red().bold(), name.cyan(), node.script_rel.red());
+                issues += 1;
+                continue;
+            }
+
+            // Try importing the node script to catch syntax/import errors
+            let import_check = Command::new("python3")
+                .arg("-c")
+                .arg(format!(
+                    "import ast, sys; ast.parse(open('{}').read()); print('ok')",
+                    node.script.display()
+                ))
+                .output();
+
+            match import_check {
+                Ok(out) if out.status.success() => {
+                    // Check for hot-reload-off
+                    let hro = is_hot_reload_disabled(&node.script);
+                    println!(
+                        "  {} [{}]  {}  {}",
+                        "✓".green().bold(),
+                        name.cyan(),
+                        node.script_rel.dimmed(),
+                        if hro { "hot-reload-off".yellow().to_string() } else { "".to_string() }
+                    );
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    println!("  {} [{}] syntax error:", "✗".red().bold(), name.cyan());
+                    for line in err.lines().take(3) {
+                        println!("    {}", line.red());
+                    }
+                    issues += 1;
+                }
+                Err(e) => {
+                    println!("  {} [{}] could not check: {}", "⚠".yellow().bold(), name.cyan(), e);
+                    warnings += 1;
+                }
+            }
+        }
+
+        println!();
+
+        // ── Launch pipelines ──────────────────────────────────────────────
+        if !config.launch.is_empty() {
+            println!("  {}", "Launch Pipelines".white().bold());
+            for (name, pipeline) in &config.launch {
+                let node_names: Vec<&str> = pipeline.nodes.iter()
+                    .map(|n| n.name.as_str())
+                    .collect();
+                println!(
+                    "  {} [{}]  {} node{}  {}",
+                    "✓".green().bold(),
+                    name.cyan(),
+                    pipeline.nodes.len(),
+                    if pipeline.nodes.len() == 1 { "" } else { "s" },
+                    format!("[{}]", node_names.join(", ")).dimmed()
+                );
+
+                // Check depends_on chains make sense
+                for node in &pipeline.nodes {
+                    if let Some(ref dep) = node.depends_on {
+                        let dep_exists = pipeline.nodes.iter().any(|n| &n.name == dep);
+                        if !dep_exists {
+                            println!(
+                                "    {} [{}] depends_on \"{}\" which is not in this pipeline",
+                                "⚠".yellow(), node.name.cyan(), dep.yellow()
+                            );
+                            warnings += 1;
+                        }
+                    }
+                }
+            }
+            println!();
+        }
+
+        // ── Dependencies ─────────────────────────────────────────────────
+        if !config.dependencies.is_empty() {
+            println!("  {}", "Dependencies".white().bold());
+            for dep in &config.dependencies {
+                let check = Command::new("python3")
+                    .arg("-c")
+                    .arg(format!("import {}", dep.name.replace('-', "_")))
+                    .output();
+                match check {
+                    Ok(out) if out.status.success() => {
+                        println!(
+                            "  {} {}  {}",
+                            "✓".green().bold(),
+                            dep.name.white(),
+                            dep.version.as_deref().unwrap_or("*").dimmed()
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "  {} {} not installed",
+                            "✗".red().bold(),
+                            dep.name.white()
+                        );
+                        println!(
+                            "    Try: {}",
+                            format!("pip install {}", dep.name).cyan()
+                        );
+                        issues += 1;
+                    }
+                }
+            }
+            println!();
+        }
+    }
+
+    // ── Summary ──────────────────────────────────────────────────────────────
+    println!("  {}", "─".repeat(44).dimmed());
+    println!();
+    if issues == 0 && warnings == 0 {
+        println!(
+            "  {} Everything looks good. Make your code reach the robot.",
+            "✓".green().bold()
+        );
+    } else {
+        if issues > 0 {
+            println!(
+                "  {} {} issue{} found",
+                "✗".red().bold(),
+                issues.to_string().red().bold(),
+                if issues == 1 { "" } else { "s" }
+            );
+        }
+        if warnings > 0 {
+            println!(
+                "  {} {} warning{}",
+                "⚠".yellow().bold(),
+                warnings.to_string().yellow().bold(),
+                if warnings == 1 { "" } else { "s" }
+            );
+        }
+    }
+    println!();
+}
+
+/// Detect ROS2 distro name from AMENT_PREFIX_PATH
+fn detect_ros2_distro(ament_prefix: &str) -> String {
+    let path = ament_prefix.split(':').next().unwrap_or("");
+    for distro in &["humble", "iron", "jazzy", "rolling", "galactic", "foxy"] {
+        if path.contains(distro) {
+            return distro.to_string();
+        }
+    }
+    "unknown distro".to_string()
 }
 
 fn cmd_coming_soon(cmd: &str) {
