@@ -1,13 +1,14 @@
 use colored::Colorize;
-use reachpy_config::{ConfigError, ReachConfig};
+use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use reachpy_config::{ConfigError, ReachConfig, NodeConfig};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ─── Embedded launcher.py ─────────────────────────────────────────────────────
-// Baked into the binary at compile time. No external file needed.
 const LAUNCHER_PY: &str = include_str!("../python/launcher.py");
 
 // ─── Banner ───────────────────────────────────────────────────────────────────
@@ -28,20 +29,117 @@ fn print_help() {
     println!("  {} {}", "reach".white().bold(), "— Make your code reach the robot.".dimmed());
     println!();
     println!("  {}", "COMMANDS".dimmed());
-    println!("  {}  {}  {}", "reach create".cyan().bold(), "<name>".white(),    "Create a new ReachPy workspace".dimmed());
-    println!("  {}          {}", "reach config".cyan().bold(),                  "Show resolved config for current workspace".dimmed());
-    println!("  {}  {}  {}", "reach run".cyan().bold(), "[profile]".white(),    "Run a launch profile (default: 'default')".dimmed());
-    println!("  {}    {}",    "reach dev".cyan().bold(),                        "Start hot-reload dev server  (coming soon)".dimmed());
-    println!("  {}  {}",      "reach build".cyan().bold(),                      "Bundle for production         (coming soon)".dimmed());
-    println!("  {}  {}",      "reach doctor".cyan().bold(),                     "Diagnose workspace issues     (coming soon)".dimmed());
+    println!("  {}  {}     {}", "reach create".cyan().bold(), "<name>".white(),              "Create a new ReachPy workspace".dimmed());
+    println!("  {}             {}", "reach config".cyan().bold(),                            "Show resolved config".dimmed());
+    println!("  {}             {}", "reach run".cyan().bold(),                               "Run default launch profile with hot reload".dimmed());
+    println!("  {}  {}  {}", "reach run".cyan().bold(), "<profile|node...>".white(),         "Run a profile or specific nodes".dimmed());
+    println!("  {}  {}  {}", "reach launch".cyan().bold(), "<pipeline>".white(),             "Run a named launch pipeline".dimmed());
+    println!("  {}          {}", "reach build".cyan().bold(),                                "coming soon".dimmed());
+    println!("  {}         {}", "reach doctor".cyan().bold(),                                "coming soon".dimmed());
     println!();
 }
 
-// ─── reach create ─────────────────────────────────────────────────────────────
+// ─── Process manager ─────────────────────────────────────────────────────────
+
+struct NodeProcess {
+    name: String,
+    config: NodeConfig,
+    child: Option<Child>,
+}
+
+impl NodeProcess {
+    fn new(name: String, config: NodeConfig) -> Self {
+        NodeProcess { name, config, child: None }
+    }
+
+    fn start(&mut self, launcher: &PathBuf, reach_config: &ReachConfig) {
+        println!(
+            "  {} {}  {}",
+            "▶".green().bold(),
+            format!("[{}]", self.name).cyan().bold(),
+            self.config.script_rel.dimmed()
+        );
+        let mut cmd = build_node_command(launcher, &self.config.script, &self.name, reach_config);
+        match cmd.spawn() {
+            Ok(child) => self.child = Some(child),
+            Err(e) => eprintln!(
+                "  {} Failed to start [{}]: {}", "✗".red().bold(), self.name, e
+            ),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(ref mut child) = self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+    }
+
+    fn restart(&mut self, launcher: &PathBuf, reach_config: &ReachConfig) {
+        self.stop();
+        std::thread::sleep(Duration::from_millis(150));
+        println!(
+            "  {} {} {}",
+            "↻".bright_blue().bold(),
+            format!("[{}]", self.name).cyan().bold(),
+            "reloading...".bright_blue()
+        );
+        self.start(launcher, reach_config);
+        println!(
+            "  {} {} {}",
+            "✓".green().bold(),
+            format!("[{}]", self.name).cyan(),
+            "hot reloaded".green()
+        );
+    }
+
+    fn is_running(&mut self) -> bool {
+        if let Some(ref mut child) = self.child {
+            matches!(child.try_wait(), Ok(None))
+        } else {
+            false
+        }
+    }
+}
+
+// ─── Hot reload helpers ───────────────────────────────────────────────────────
+
+/// Check if a Python file has # hot-reload-off in its first 5 lines
+fn is_hot_reload_disabled(path: &Path) -> bool {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        for line in content.lines().take(5) {
+            let trimmed = line.trim();
+            if trimmed == "# hot-reload-off" || trimmed == "#hot-reload-off" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Find which node owns a changed file
+fn find_owning_node(
+    changed: &Path,
+    nodes: &HashMap<String, NodeConfig>,
+) -> Option<String> {
+    for (name, node) in nodes {
+        if changed == node.script {
+            return Some(name.clone());
+        }
+        if let (Some(cp), Some(sp)) = (changed.parent(), node.script.parent()) {
+            if cp == sp {
+                return Some(name.clone());
+            }
+        }
+    }
+    None
+}
+
+// ─── reach create ────────────────────────────────────────────────────────────
 
 fn cmd_create(name: &str) {
     let workspace = std::path::Path::new(name);
-
     if workspace.exists() {
         eprintln!("  {} Directory \"{}\" already exists.", "✗".red().bold(), name);
         std::process::exit(1);
@@ -50,8 +148,7 @@ fn cmd_create(name: &str) {
     println!();
     println!("  {} Creating ReachPy workspace {}...", "→".bright_blue().bold(), name.white().bold());
 
-    let dirs = ["src", "config", "models", "launch"];
-    for dir in &dirs {
+    for dir in &["src", "config", "models", "launch"] {
         std::fs::create_dir_all(workspace.join(dir))
             .unwrap_or_else(|e| fatal(&format!("Failed to create {}: {}", dir, e)));
     }
@@ -59,11 +156,7 @@ fn cmd_create(name: &str) {
     let toml = format!(
 r#"# ─────────────────────────────────────────────
 #  reach.toml — ReachPy workspace configuration
-#  This single file replaces:
-#    - CMakeLists.txt
-#    - package.xml
-#    - setup.py
-#    - XML launch files
+#  Replaces: CMakeLists.txt, package.xml, setup.py, XML launch files
 # ─────────────────────────────────────────────
 
 [project]
@@ -93,37 +186,23 @@ hot_reload_ignore = ["config/", "models/"]
     std::fs::write(workspace.join("reach.toml"), toml)
         .unwrap_or_else(|e| fatal(&format!("Failed to write reach.toml: {}", e)));
 
-    let example_node = r#"# ReachPy example node
-# This runs as a real ROS2 node via `reach run`
-import time
+    let example = "# ReachPy example node\n# Add: # hot-reload-off at the top to disable hot reload for this node\nimport time\n\nprint('[example] Node started - make your code reach the robot.')\ni = 0\nwhile True:\n    print(f'[example] tick {i}')\n    i += 1\n    time.sleep(1)\n";
+    std::fs::write(workspace.join("src/example.py"), example)
+        .unwrap_or_else(|e| fatal(&format!("Failed to write example: {}", e)));
 
-print("[example] Node started — make your code reach the robot.")
-
-i = 0
-while True:
-    print(f"[example] tick {i}")
-    i += 1
-    time.sleep(1)
-"#;
-
-    std::fs::write(workspace.join("src/example.py"), example_node)
-        .unwrap_or_else(|e| fatal(&format!("Failed to write example node: {}", e)));
-
-    let gitignore = "# ReachPy\n.reach/\ndist/\n__pycache__/\n*.pyc\n*.pyo\nmodels/\n.env\n";
-    std::fs::write(workspace.join(".gitignore"), gitignore)
+    std::fs::write(workspace.join(".gitignore"),
+        "# ReachPy\n.reach/\ndist/\n__pycache__/\n*.pyc\nmodels/\n.env\n")
         .unwrap_or_else(|e| fatal(&format!("Failed to write .gitignore: {}", e)));
 
     println!();
     println!("  {} {}", "✓".green().bold(), format!("Created workspace \"{}\"", name).white().bold());
     println!();
-    println!("  {}", "Structure:".dimmed());
     println!("  {}  {}", "├── reach.toml".cyan(),      "← your entire config lives here".dimmed());
     println!("  {}  {}", "├── src/".white(),            "← node scripts".dimmed());
     println!("  {}  {}", "│   └── example.py".white(), "← example node".dimmed());
     println!("  {}  {}", "├── config/".white(),         "← robot config (not hot-reloaded)".dimmed());
     println!("  {}  {}", "└── models/".white(),         "← ML models (not hot-reloaded)".dimmed());
     println!();
-    println!("  {}", "Next steps:".dimmed());
     println!("  {}  {}", "cd".cyan(), name.white().bold());
     println!("  {}", "reach run".cyan().bold());
     println!();
@@ -131,7 +210,7 @@ while True:
     println!();
 }
 
-// ─── reach config ─────────────────────────────────────────────────────────────
+// ─── reach config ────────────────────────────────────────────────────────────
 
 fn cmd_config() {
     match ReachConfig::load() {
@@ -147,191 +226,314 @@ fn cmd_config() {
             println!();
         }
         Err(ConfigError::NotFound) => {
-            eprintln!();
-            eprintln!("  {} {}", "✗".red().bold(), "No reach.toml found.".red());
-            eprintln!("  Run {} to create a workspace.", "reach create <name>".cyan());
-            eprintln!();
+            eprintln!("  {} No reach.toml found. Run {} to create a workspace.",
+                "✗".red().bold(), "reach create <name>".cyan());
             std::process::exit(1);
         }
         Err(e) => {
-            eprintln!();
-            eprintln!("  {} {}", "✗".red().bold(), "Config error:".red().bold());
-            eprintln!();
+            eprintln!("  {} Config error:", "✗".red().bold());
             for line in e.to_string().lines() {
                 eprintln!("  {}", line.red());
             }
-            eprintln!();
             std::process::exit(1);
         }
     }
 }
 
-// ─── reach run ────────────────────────────────────────────────────────────────
+// ─── reach run ───────────────────────────────────────────────────────────────
 
-fn cmd_run(profile: &str) {
-    // Load and validate config
-    let config = match ReachConfig::load() {
+fn cmd_run(args: &[String]) {
+    let config = load_config_or_exit();
+
+    // Resolve which nodes to run from args
+    // Priority: if arg matches a launch profile → use profile
+    //           if arg matches node names → run those nodes
+    //           if no args → run default profile
+    let nodes_to_run: Vec<NodeConfig> = if args.is_empty() {
+        // No args — run default launch profile
+        resolve_profile("default", &config)
+    } else if args.len() == 1 {
+        // Single arg — check if it's a profile first, then a node name
+        let arg = &args[0];
+        if config.launch.contains_key(arg.as_str()) {
+            resolve_profile(arg, &config)
+        } else if config.nodes.contains_key(arg.as_str()) {
+            vec![config.nodes[arg.as_str()].clone()]
+        } else {
+            eprintln!(
+                "  {} \"{}\" is not a launch profile or node name.",
+                "✗".red().bold(), arg
+            );
+            eprintln!("  Profiles: {}", config.launch.keys().cloned().collect::<Vec<_>>().join(", "));
+            eprintln!("  Nodes:    {}", config.nodes.keys().cloned().collect::<Vec<_>>().join(", "));
+            std::process::exit(1);
+        }
+    } else {
+        // Multiple args — treat each as a node name
+        let mut nodes = Vec::new();
+        for arg in args {
+            match config.nodes.get(arg.as_str()) {
+                Some(n) => nodes.push(n.clone()),
+                None => {
+                    eprintln!("  {} Unknown node \"{}\".", "✗".red().bold(), arg);
+                    eprintln!("  Available: {}", config.nodes.keys().cloned().collect::<Vec<_>>().join(", "));
+                    std::process::exit(1);
+                }
+            }
+        }
+        nodes
+    };
+
+    if nodes_to_run.is_empty() {
+        eprintln!("  {} No nodes to run.", "✗".red().bold());
+        std::process::exit(1);
+    }
+
+    print_banner();
+    println!(
+        "  {}  {} node{}  {} hot reload",
+        "reach run".white().bold(),
+        nodes_to_run.len().to_string().white(),
+        if nodes_to_run.len() == 1 { "" } else { "s" },
+        "→".dimmed(),
+    );
+    println!();
+
+    // Write launcher
+    let launcher = write_launcher()
+        .unwrap_or_else(|e| fatal(&format!("Failed to write launcher: {}", e)));
+
+    // Check ROS2
+    if find_ros2_setup().is_none() {
+        eprintln!("  {} ROS2 not found. Source ROS2 first:", "✗".red().bold());
+        eprintln!("  {}", "source /opt/ros/humble/setup.bash".cyan());
+        std::process::exit(1);
+    }
+
+    println!("  {} {}", "domain_id:".dimmed(), config.robot.domain_id.to_string().white());
+    println!();
+
+    // Build process map
+    let processes: Arc<Mutex<HashMap<String, NodeProcess>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Start all nodes
+    {
+        let mut procs = processes.lock().unwrap();
+        for node_config in &nodes_to_run {
+            let mut proc = NodeProcess::new(node_config.name.clone(), node_config.clone());
+            proc.start(&launcher, &config);
+            procs.insert(node_config.name.clone(), proc);
+        }
+    }
+
+    println!();
+
+    // Hot reload — check which nodes have it enabled
+    let hot_reload_enabled = config.dev.hot_reload;
+    let ignore_patterns = config.dev.hot_reload_ignore.clone();
+    let project_root = config.root.clone();
+
+    if hot_reload_enabled {
+        println!("  {} watching for changes  {}", "◉".bright_blue(), "(# hot-reload-off to disable per node)".dimmed());
+    } else {
+        println!("  {} hot reload disabled in reach.toml", "○".dimmed());
+    }
+    println!("  Press {} to stop.", "Ctrl+C".cyan());
+    println!();
+
+    // Ctrl+C handler
+    let processes_ctrlc = Arc::clone(&processes);
+    let launcher_ctrlc = launcher.clone();
+    ctrlc::set_handler(move || {
+        println!();
+        println!("  {} Shutting down...", "■".yellow().bold());
+        let mut procs = processes_ctrlc.lock().unwrap();
+        for (name, proc) in procs.iter_mut() {
+            proc.stop();
+            println!("  {} [{}] stopped", "✓".green(), name.cyan());
+        }
+        let _ = std::fs::remove_file(&launcher_ctrlc);
+        println!("  {} Goodbye.", "✓".green().bold());
+        std::process::exit(0);
+    }).expect("Failed to set Ctrl-C handler");
+
+    // ── File watcher for hot reload ──────────────────────────────────────────
+    if hot_reload_enabled {
+        let processes_watcher = Arc::clone(&processes);
+        let config_clone = config.clone();
+        let launcher_clone = launcher.clone();
+
+        std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
+            let mut watcher = RecommendedWatcher::new(
+                move |res| { let _ = tx.send(res); },
+                Config::default().with_poll_interval(Duration::from_millis(200)),
+            ).expect("Failed to create watcher");
+
+            watcher.watch(&project_root, RecursiveMode::Recursive)
+                .expect("Failed to watch project");
+
+            let mut last_reload: HashMap<String, Instant> = HashMap::new();
+            let debounce = Duration::from_millis(400);
+
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Ok(event)) => {
+                        let is_relevant = matches!(
+                            event.kind,
+                            EventKind::Modify(_) | EventKind::Create(_)
+                        );
+                        if !is_relevant { continue; }
+
+                        for path in &event.paths {
+                            // Only watch .py files
+                            if path.extension().and_then(|e| e.to_str()) != Some("py") {
+                                continue;
+                            }
+
+                            // Check ignore patterns
+                            let rel = path.strip_prefix(&config_clone.root).unwrap_or(path);
+                            let rel_str = rel.to_string_lossy();
+                            if ignore_patterns.iter().any(|p| rel_str.contains(p.trim_matches('/'))) {
+                                continue;
+                            }
+                            if rel_str.contains("__pycache__") || rel_str.ends_with(".pyc") {
+                                continue;
+                            }
+
+                            // Find owning node
+                            let node_name = find_owning_node(path, &config_clone.nodes);
+
+                            let now = Instant::now();
+                            match node_name {
+                                Some(name) => {
+                                    // Debounce
+                                    if last_reload.get(&name)
+                                        .map_or(false, |l| now.duration_since(*l) < debounce) {
+                                        continue;
+                                    }
+
+                                    // Check # hot-reload-off
+                                    if is_hot_reload_disabled(path) {
+                                        println!(
+                                            "  {} {} {}",
+                                            "~".dimmed(),
+                                            format!("[{}]", name).dimmed(),
+                                            "hot-reload-off — skipping".dimmed()
+                                        );
+                                        continue;
+                                    }
+
+                                    last_reload.insert(name.clone(), now);
+
+                                    println!(
+                                        "  {} {} changed",
+                                        "→".bright_blue(),
+                                        rel.display().to_string().white()
+                                    );
+
+                                    let mut procs = processes_watcher.lock().unwrap();
+                                    if let Some(proc) = procs.get_mut(&name) {
+                                        proc.restart(&launcher_clone, &config_clone);
+                                    }
+                                }
+                                None => {
+                                    // Shared module — reload all nodes that don't have hot-reload-off
+                                    let key = "__all__".to_string();
+                                    if last_reload.get(&key)
+                                        .map_or(false, |l| now.duration_since(*l) < debounce) {
+                                        continue;
+                                    }
+                                    last_reload.insert(key, now);
+
+                                    println!(
+                                        "  {} {} changed → reloading all eligible nodes",
+                                        "→".yellow(),
+                                        rel.display().to_string().white()
+                                    );
+
+                                    let mut procs = processes_watcher.lock().unwrap();
+                                    for (_, proc) in procs.iter_mut() {
+                                        if !is_hot_reload_disabled(&proc.config.script) {
+                                            proc.restart(&launcher_clone, &config_clone);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => eprintln!("  {} Watcher error: {}", "✗".red(), e),
+                    Err(_) => {} // timeout, continue
+                }
+            }
+        });
+    }
+
+    // ── Supervisor loop ──────────────────────────────────────────────────────
+    let mut dead: HashSet<String> = HashSet::new();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let mut procs = processes.lock().unwrap();
+        for (name, proc) in procs.iter_mut() {
+            if dead.contains(name) { continue; }
+            match proc.child.as_mut().and_then(|c| c.try_wait().ok()) {
+                Some(Some(status)) => {
+                    dead.insert(name.clone());
+                    if !status.success() {
+                        println!(
+                            "  {} [{}] exited with error. Check output above.",
+                            "!".red().bold(), name.cyan()
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        if dead.len() == procs.len() && !procs.is_empty() {
+            println!("  {} All nodes stopped.", "■".yellow().bold());
+            let _ = std::fs::remove_file(&launcher);
+            std::process::exit(0);
+        }
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn load_config_or_exit() -> ReachConfig {
+    match ReachConfig::load() {
         Ok(c) => c,
         Err(ConfigError::NotFound) => {
-            eprintln!("  {} No reach.toml found. Are you inside a ReachPy workspace?", "✗".red().bold());
+            eprintln!("  {} No reach.toml found.", "✗".red().bold());
             std::process::exit(1);
         }
         Err(e) => {
             eprintln!("  {} {}", "✗".red().bold(), e.to_string().red());
             std::process::exit(1);
         }
-    };
+    }
+}
 
-    // Resolve which nodes to run
-    let node_names = match config.launch.resolve_profile(profile, &config.nodes) {
-        Some(names) => names,
+fn resolve_profile(profile: &str, config: &ReachConfig) -> Vec<NodeConfig> {
+    match config.launch.get(profile) {
+        Some(pipeline) => pipeline.nodes.iter()
+            .filter_map(|n| config.nodes.get(&n.name))
+            .cloned()
+            .collect(),
+        None if profile == "default" => {
+            // No default pipeline — run all nodes
+            config.nodes.values().cloned().collect()
+        }
         None => {
-            eprintln!(
-                "  {} Launch profile \"{}\" not found in reach.toml.",
-                "✗".red().bold(), profile
-            );
-            eprintln!("  Available profiles: {}",
-                config.launch.profiles.keys()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            eprintln!("  {} Launch profile \"{}\" not found.", "✗".red().bold(), profile);
+            if !config.launch.is_empty() {
+                eprintln!("  Available: {}", config.launch.keys().cloned().collect::<Vec<_>>().join(", "));
+            }
             std::process::exit(1);
-        }
-    };
-
-    print_banner();
-    println!(
-        "  {} {}  {}",
-        "reach run".white().bold(),
-        format!("profile: {}", profile).dimmed(),
-        format!("({} node{})", node_names.len(), if node_names.len() == 1 { "" } else { "s" }).dimmed()
-    );
-    println!();
-
-    // Write embedded launcher.py to a temp file
-    let launcher_path = write_launcher().unwrap_or_else(|e| {
-        fatal(&format!("Failed to write launcher: {}", e))
-    });
-
-    // Detect ROS2 installation
-    let ros_setup = find_ros2_setup();
-    if ros_setup.is_none() {
-        eprintln!(
-            "  {} ROS2 not found. Make sure ROS2 is installed and sourced.",
-            "✗".red().bold()
-        );
-        eprintln!("  Try: {}", "source /opt/ros/humble/setup.bash".cyan());
-        std::process::exit(1);
-    }
-    let ros_setup = ros_setup.unwrap();
-    println!("  {} {}", "ROS2:".dimmed(), ros_setup.display().to_string().white());
-    println!("  {} {}", "domain_id:".dimmed(), config.robot.domain_id.to_string().white());
-    println!();
-
-    // Spawn all nodes
-    let processes: Arc<Mutex<Vec<(String, Child)>>> = Arc::new(Mutex::new(Vec::new()));
-
-    {
-        let mut procs = processes.lock().unwrap();
-        for node_name in &node_names {
-            let node_name = node_name.to_string();
-            let node_config = match config.nodes.get(&node_name) {
-                Some(n) => n,
-                None => {
-                    eprintln!("  {} Node \"{}\" not found", "✗".red().bold(), node_name);
-                    continue;
-                }
-            };
-
-            println!(
-                "  {} {}  {}",
-                "▶".green().bold(),
-                format!("[{}]", node_name).cyan().bold(),
-                node_config.script_rel.dimmed()
-            );
-
-            // Build the command:
-            // python3 /tmp/reachpy-launcher.py <script> <name> [--ros-args ...]
-            let mut cmd = build_node_command(
-                &launcher_path,
-                &node_config.script,
-                &node_name,
-                &config,
-            );
-
-            match cmd.spawn() {
-                Ok(child) => {
-                    procs.push((node_name, child));
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  {} Failed to start [{}]: {}",
-                        "✗".red().bold(), node_name, e
-                    );
-                }
-            }
-        }
-    }
-
-    println!();
-    println!("  {} All nodes running. Press {} to stop.", "✓".green().bold(), "Ctrl+C".cyan());
-    println!();
-
-    // Ctrl+C handler — clean shutdown
-    let processes_ctrlc = Arc::clone(&processes);
-    let launcher_path_ctrlc = launcher_path.clone();
-    ctrlc::set_handler(move || {
-        println!();
-        println!("  {} Shutting down all nodes...", "■".yellow().bold());
-        let mut procs = processes_ctrlc.lock().unwrap();
-        for (name, child) in procs.iter_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-            println!("  {} [{}] stopped", "✓".green(), name.cyan());
-        }
-        // Clean up temp launcher
-        let _ = std::fs::remove_file(&launcher_path_ctrlc);
-        println!("  {} Goodbye.", "✓".green().bold());
-        std::process::exit(0);
-    }).expect("Failed to set Ctrl-C handler");
-
-    // Supervisor loop — watch for crashed nodes
-    // Supervisor loop
-    let mut dead: std::collections::HashSet<String> = std::collections::HashSet::new();
-    loop {
-        std::thread::sleep(Duration::from_millis(500));
-        let mut procs = processes.lock().unwrap();
-        for (name, child) in procs.iter_mut() {
-            if dead.contains(name) { continue; }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    dead.insert(name.clone());
-                    if !status.success() {
-                        println!(
-                            "  {} [{}] exited with error. Check output above.",
-                            "!".red().bold(),
-                            name.cyan()
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!("  {} Error watching [{}]: {}", "✗".red(), name, e);
-                }
-            }
-        }
-        // If all nodes are dead, exit
-        if dead.len() == procs.len() {
-            println!("  {} All nodes have stopped.", "■".yellow().bold());
-            std::process::exit(0);
         }
     }
 }
 
-// ─── Helpers for reach run ────────────────────────────────────────────────────
-
-/// Write the embedded launcher.py to /tmp and return its path
 fn write_launcher() -> Result<PathBuf, std::io::Error> {
     let path = std::env::temp_dir().join("reachpy-launcher.py");
     let mut file = std::fs::File::create(&path)?;
@@ -339,41 +541,23 @@ fn write_launcher() -> Result<PathBuf, std::io::Error> {
     Ok(path)
 }
 
-/// Find the ROS2 setup.bash — checks common install locations
 fn find_ros2_setup() -> Option<PathBuf> {
-    // Check if already sourced via env var
-    if let Ok(ament_prefix) = std::env::var("AMENT_PREFIX_PATH") {
-        if !ament_prefix.is_empty() {
-            // ROS2 already sourced — find the setup path from prefix
-            let first = ament_prefix.split(':').next().unwrap_or("");
-            let setup = PathBuf::from(first).join("../setup.bash");
-            if setup.exists() {
-                return Some(setup);
-            }
-            // Return a sentinel — we know ROS2 is sourced even if we can't pinpoint setup.bash
-            return Some(PathBuf::from(first));
+    if let Ok(prefix) = std::env::var("AMENT_PREFIX_PATH") {
+        if !prefix.is_empty() {
+            return Some(PathBuf::from(prefix.split(':').next().unwrap_or("")));
         }
     }
-
-    // Common ROS2 install locations
-    let candidates = [
+    for candidate in &[
         "/opt/ros/humble/setup.bash",
         "/opt/ros/iron/setup.bash",
         "/opt/ros/jazzy/setup.bash",
-        "/opt/ros/rolling/setup.bash",
-    ];
-
-    for candidate in &candidates {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
-            return Some(path);
-        }
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.exists() { return Some(p); }
     }
-
     None
 }
 
-/// Build the full command to launch a single node
 fn build_node_command(
     launcher: &PathBuf,
     script: &PathBuf,
@@ -381,59 +565,30 @@ fn build_node_command(
     config: &ReachConfig,
 ) -> Command {
     let mut cmd = Command::new("python3");
-
-    cmd.arg(launcher)
-       .arg(script)
-       .arg(node_name);
-
-    // Set ROS_DOMAIN_ID from reach.toml
+    cmd.arg(launcher).arg(script).arg(node_name);
     cmd.env("ROS_DOMAIN_ID", config.robot.domain_id.to_string());
 
-    // Build --ros-args if we have remappings or node-specific args
     let mut ros_args: Vec<String> = Vec::new();
-
-    // Global remappings from [ros.remappings]
     for (from, to) in &config.ros.remappings {
         ros_args.push("-r".to_string());
         ros_args.push(format!("{}:={}", from, to));
     }
-
-    // Per-node args from [ros.node_args]
     if let Some(extra) = config.ros.node_args.get(node_name) {
         ros_args.extend(extra.clone());
     }
-
-    // Namespace from [ros]
     if let Some(ref ns) = config.ros.namespace {
-        ros_args.push("--ros-args".to_string());
         ros_args.push("-r".to_string());
         ros_args.push(format!("__ns:={}", ns));
     }
-
     if !ros_args.is_empty() {
         cmd.arg("--ros-args");
-        for arg in ros_args {
-            cmd.arg(arg);
-        }
+        for arg in ros_args { cmd.arg(arg); }
     }
 
-    // Inherit stdout/stderr so node output appears in terminal
     cmd.stdout(std::process::Stdio::inherit())
        .stderr(std::process::Stdio::inherit());
-
     cmd
 }
-
-// ─── Stubs ────────────────────────────────────────────────────────────────────
-
-fn cmd_coming_soon(cmd: &str) {
-    println!();
-    println!("  {} {} is coming soon.", "→".bright_blue().bold(), format!("reach {}", cmd).cyan().bold());
-    println!("  Follow {} for updates.", "ascii-robotics.com".white());
-    println!();
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn fatal(msg: &str) -> ! {
     eprintln!("  {} {}", "✗".red().bold(), msg.red());
@@ -450,23 +605,384 @@ fn main() {
             match args.get(2) {
                 Some(name) => cmd_create(name),
                 None => {
-                    eprintln!("  {} Usage: {}", "✗".red().bold(), "reach create <workspace-name>".cyan());
+                    eprintln!("  {} Usage: reach create <name>", "✗".red().bold());
                     std::process::exit(1);
                 }
             }
         }
         Some("config") => cmd_config(),
-        Some("run")    => {
-            let profile = args.get(2).map(|s| s.as_str()).unwrap_or("default");
-            cmd_run(profile);
+        Some("run")    => cmd_run(&args[2..].to_vec()),
+        Some("launch") => {
+            match args.get(2) {
+                Some(name) => cmd_launch(name),
+                None => {
+                    eprintln!("  {} Usage: reach launch <pipeline>", "✗".red().bold());
+                    eprintln!("  Example: reach launch prod");
+                    std::process::exit(1);
+                }
+            }
         }
-        Some("dev")    => cmd_coming_soon("dev"),
         Some("build")  => cmd_coming_soon("build"),
         Some("doctor") => cmd_coming_soon("doctor"),
         Some(unknown)  => {
-            eprintln!("  {} Unknown command \"{}\". Run {} for help.", "✗".red().bold(), unknown, "reach".cyan());
+            eprintln!("  {} Unknown command \"{}\". Run {} for help.",
+                "✗".red().bold(), unknown, "reach".cyan());
             std::process::exit(1);
         }
         None => print_help(),
+    }
+}
+
+fn cmd_coming_soon(cmd: &str) {
+    println!();
+    println!("  {} {} coming soon.", "→".bright_blue().bold(), format!("reach {}", cmd).cyan().bold());
+    println!("  {}", "ascii-robotics.com".white());
+    println!();
+}
+
+// ─── reach launch ────────────────────────────────────────────────────────────
+
+pub fn cmd_launch(pipeline_name: &str) {
+    let config = load_config_or_exit();
+
+    let pipeline = match config.launch.get(pipeline_name) {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!(
+                "  {} Pipeline \"{}\" not found in reach.toml.",
+                "✗".red().bold(), pipeline_name
+            );
+            if config.launch.is_empty() {
+                eprintln!("  No pipelines defined. Add a [launch.{}] section to reach.toml.", pipeline_name);
+            } else {
+                eprintln!("  Available pipelines: {}",
+                    config.launch.keys().cloned().collect::<Vec<_>>().join(", "));
+            }
+            std::process::exit(1);
+        }
+    };
+
+    print_banner();
+    println!(
+        "  {}  pipeline: {}  ({} node{})",
+        "reach launch".white().bold(),
+        pipeline_name.cyan().bold(),
+        pipeline.nodes.len(),
+        if pipeline.nodes.len() == 1 { "" } else { "s" }
+    );
+    println!();
+
+    if find_ros2_setup().is_none() {
+        eprintln!("  {} ROS2 not found. Source ROS2 first:", "✗".red().bold());
+        eprintln!("  {}", "source /opt/ros/humble/setup.bash".cyan());
+        std::process::exit(1);
+    }
+
+    println!("  {} {}", "domain_id:".dimmed(), config.robot.domain_id.to_string().white());
+    println!();
+
+    let launcher = write_launcher()
+        .unwrap_or_else(|e| fatal(&format!("Failed to write launcher: {}", e)));
+
+    let processes: Arc<Mutex<HashMap<String, NodeProcess>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Ctrl+C handler
+    let processes_ctrlc = Arc::clone(&processes);
+    let launcher_ctrlc = launcher.clone();
+    ctrlc::set_handler(move || {
+        println!();
+        println!("  {} Shutting down pipeline...", "■".yellow().bold());
+        let mut procs = processes_ctrlc.lock().unwrap();
+        for (name, proc) in procs.iter_mut() {
+            proc.stop();
+            println!("  {} [{}] stopped", "✓".green(), name.cyan());
+        }
+        let _ = std::fs::remove_file(&launcher_ctrlc);
+        println!("  {} Pipeline stopped. Goodbye.", "✓".green().bold());
+        std::process::exit(0);
+    }).expect("Failed to set Ctrl-C handler");
+
+    // Launch nodes in order, respecting delay and depends_on
+    for launch_node in &pipeline.nodes {
+        let node_config = match config.nodes.get(&launch_node.name) {
+            Some(n) => n.clone(),
+            None => {
+                eprintln!("  {} Node \"{}\" not found.", "✗".red().bold(), launch_node.name);
+                continue;
+            }
+        };
+
+        // Wait for depends_on node to be running
+        if let Some(ref dep) = launch_node.depends_on {
+            print!(
+                "  {} [{}] waiting for [{}]...",
+                "⏳".yellow(), launch_node.name.cyan(), dep.cyan()
+            );
+            // Poll until the dependency is running
+            loop {
+                let procs = processes.lock().unwrap();
+                if procs.contains_key(dep.as_str()) {
+                    println!(" {}", "ready".green());
+                    break;
+                }
+                drop(procs);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        // Apply delay
+        if launch_node.delay > 0.0 {
+            println!(
+                "  {} [{}] waiting {:.1}s...",
+                "⏱".dimmed(), launch_node.name.cyan(), launch_node.delay
+            );
+            std::thread::sleep(Duration::from_millis((launch_node.delay * 1000.0) as u64));
+        }
+
+        // Build command with params
+        let mut cmd = build_node_command_with_params(
+            &launcher,
+            &node_config.script,
+            &launch_node.name,
+            &config,
+            &launch_node.params,
+        );
+
+        println!(
+            "  {} {}  {}",
+            "▶".green().bold(),
+            format!("[{}]", launch_node.name).cyan().bold(),
+            node_config.script_rel.dimmed()
+        );
+
+        if !launch_node.params.is_empty() {
+            let param_str: Vec<String> = launch_node.params.iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            println!("      {} {}", "params:".dimmed(), param_str.join(", ").white());
+        }
+
+        match cmd.spawn() {
+            Ok(child) => {
+                let mut procs = processes.lock().unwrap();
+                procs.insert(
+                    launch_node.name.clone(),
+                    NodeProcess { name: launch_node.name.clone(), config: node_config, child: Some(child) }
+                );
+            }
+            Err(e) => {
+                eprintln!("  {} Failed to start [{}]: {}", "✗".red().bold(), launch_node.name, e);
+            }
+        }
+
+        // wait_ready — wait until node appears on ROS2 graph
+        if launch_node.wait_ready {
+            println!(
+                "  {} [{}] waiting until ready on ROS2 graph...",
+                "⏳".yellow(), launch_node.name.cyan()
+            );
+            wait_until_node_ready(&launch_node.name, &config.robot.domain_id);
+            println!(
+                "  {} [{}] {}",
+                "✓".green(), launch_node.name.cyan(), "ready".green()
+            );
+        }
+    }
+
+    println!();
+
+    // Hot reload watcher — same as reach run, respects # hot-reload-off
+    let hot_reload_enabled = config.dev.hot_reload;
+    let ignore_patterns = config.dev.hot_reload_ignore.clone();
+    let project_root = config.root.clone();
+
+    if hot_reload_enabled {
+        println!("  {} watching for changes  {}", "◉".bright_blue(), "(# hot-reload-off to disable per node)".dimmed());
+    } else {
+        println!("  {} hot reload disabled in reach.toml", "○".dimmed());
+    }
+    println!("  {} Pipeline running. Press {} to stop.", "✓".green().bold(), "Ctrl+C".cyan());
+    println!();
+
+    if hot_reload_enabled {
+        let processes_watcher = Arc::clone(&processes);
+        let config_clone = config.clone();
+        let launcher_clone = launcher.clone();
+
+        std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
+            let mut watcher = RecommendedWatcher::new(
+                move |res| { let _ = tx.send(res); },
+                Config::default().with_poll_interval(Duration::from_millis(200)),
+            ).expect("Failed to create watcher");
+
+            watcher.watch(&project_root, RecursiveMode::Recursive)
+                .expect("Failed to watch project");
+
+            let mut last_reload: HashMap<String, Instant> = HashMap::new();
+            let debounce = Duration::from_millis(400);
+
+            loop {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Ok(event)) => {
+                        let is_relevant = matches!(
+                            event.kind,
+                            EventKind::Modify(_) | EventKind::Create(_)
+                        );
+                        if !is_relevant { continue; }
+
+                        for path in &event.paths {
+                            if path.extension().and_then(|e| e.to_str()) != Some("py") { continue; }
+
+                            let rel = path.strip_prefix(&config_clone.root).unwrap_or(path);
+                            let rel_str = rel.to_string_lossy();
+                            if ignore_patterns.iter().any(|p| rel_str.contains(p.trim_matches('/'))) { continue; }
+                            if rel_str.contains("__pycache__") || rel_str.ends_with(".pyc") { continue; }
+
+                            let now = Instant::now();
+                            let node_name = find_owning_node(path, &config_clone.nodes);
+
+                            match node_name {
+                                Some(name) => {
+                                    if last_reload.get(&name).map_or(false, |l| now.duration_since(*l) < debounce) { continue; }
+                                    if is_hot_reload_disabled(path) {
+                                        println!("  {} [{}] {}", "~".dimmed(), name.dimmed(), "hot-reload-off — skipping".dimmed());
+                                        continue;
+                                    }
+                                    last_reload.insert(name.clone(), now);
+                                    println!("  {} {} changed", "→".bright_blue(), rel.display().to_string().white());
+                                    let mut procs = processes_watcher.lock().unwrap();
+                                    if let Some(proc) = procs.get_mut(&name) {
+                                        proc.restart(&launcher_clone, &config_clone);
+                                    }
+                                }
+                                None => {
+                                    let key = "__all__".to_string();
+                                    if last_reload.get(&key).map_or(false, |l| now.duration_since(*l) < debounce) { continue; }
+                                    last_reload.insert(key, now);
+                                    println!("  {} {} changed → reloading all eligible nodes", "→".yellow(), rel.display().to_string().white());
+                                    let mut procs = processes_watcher.lock().unwrap();
+                                    for (_, proc) in procs.iter_mut() {
+                                        if !is_hot_reload_disabled(&proc.config.script) {
+                                            proc.restart(&launcher_clone, &config_clone);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => eprintln!("  {} Watcher error: {}", "✗".red(), e),
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
+    // Supervisor loop
+    let mut dead: HashSet<String> = HashSet::new();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let mut procs = processes.lock().unwrap();
+        for (name, proc) in procs.iter_mut() {
+            if dead.contains(name) { continue; }
+            match proc.child.as_mut().and_then(|c| c.try_wait().ok()) {
+                Some(Some(status)) => {
+                    dead.insert(name.clone());
+                    if !status.success() {
+                        println!(
+                            "  {} [{}] exited with error.",
+                            "!".red().bold(), name.cyan()
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        if dead.len() == procs.len() && !procs.is_empty() {
+            println!("  {} All nodes stopped.", "■".yellow().bold());
+            let _ = std::fs::remove_file(&launcher);
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Build command with per-pipeline params on top of global config
+fn build_node_command_with_params(
+    launcher: &PathBuf,
+    script: &PathBuf,
+    node_name: &str,
+    config: &ReachConfig,
+    params: &HashMap<String, String>,
+) -> Command {
+    let mut cmd = Command::new("python3");
+    cmd.arg(launcher).arg(script).arg(node_name);
+    cmd.env("ROS_DOMAIN_ID", config.robot.domain_id.to_string());
+
+    let mut ros_args: Vec<String> = Vec::new();
+
+    // Global remappings
+    for (from, to) in &config.ros.remappings {
+        ros_args.push("-r".to_string());
+        ros_args.push(format!("{}:={}", from, to));
+    }
+
+    // Per-node args from [ros.node_args]
+    if let Some(extra) = config.ros.node_args.get(node_name) {
+        ros_args.extend(extra.clone());
+    }
+
+    // Namespace
+    if let Some(ref ns) = config.ros.namespace {
+        ros_args.push("-r".to_string());
+        ros_args.push(format!("__ns:={}", ns));
+    }
+
+    // Pipeline params — become -p key:=value
+    for (key, val) in params {
+        ros_args.push("-p".to_string());
+        ros_args.push(format!("{}:={}", key, val));
+    }
+
+    if !ros_args.is_empty() {
+        cmd.arg("--ros-args");
+        for arg in ros_args { cmd.arg(arg); }
+    }
+
+    cmd.stdout(std::process::Stdio::inherit())
+       .stderr(std::process::Stdio::inherit());
+    cmd
+}
+
+/// Poll the ROS2 graph until the node appears
+/// Uses `ros2 node list` — simple and doesn't require lifecycle nodes
+fn wait_until_node_ready(node_name: &str, domain_id: &u32) {
+    let timeout = std::time::Instant::now();
+    let max_wait = Duration::from_secs(30);
+
+    loop {
+        if timeout.elapsed() > max_wait {
+            eprintln!(
+                "  {} [{}] timed out waiting to appear on ROS2 graph.",
+                "!".yellow(), node_name
+            );
+            return;
+        }
+
+        let output = Command::new("ros2")
+            .arg("node")
+            .arg("list")
+            .env("ROS_DOMAIN_ID", domain_id.to_string())
+            .output();
+
+        if let Ok(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // ROS2 node names are prefixed with /
+            if stdout.contains(&format!("/{}", node_name)) || stdout.contains(node_name) {
+                return;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(300));
     }
 }
