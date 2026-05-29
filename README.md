@@ -87,11 +87,14 @@ reach run detector tracker # multiple nodes
 
 ### `reach launch`
 
-Runs a named launch profile with **ordered startup** (staggered delays, `depends_on`, `wait_ready`, and per-node `params`). This is aimed at production-style bring-up where nodes must start in sequence.
+Runs a named pipeline from `reach.toml` **in order**, honoring:
+
+- **`delay`** — wait N seconds before starting a node
+- **`depends_on`** — wait until another node in the pipeline is running
+- **`wait_ready`** — block until the node appears on the ROS 2 graph (`ros2 node list`)
+- **`params`** — per-node ROS parameters (`--ros-args -p key:=value`)
 
 Use `reach run` for everyday dev (parallel start + hot reload). Use `reach launch` when startup order and readiness gates matter.
-
-> **Note:** The CLI and config crate are being aligned on a richer pipeline format (`[launch.<name>]` with per-step options). Until that lands, profiles in `reach.toml` use the simple list form under `[launch]`.
 
 ## `reach.toml` reference
 
@@ -112,9 +115,17 @@ domain_id = 0
 detector   = "src/detector.py"
 controller = "src/controller.py"
 
-[launch]
-default = ["detector", "controller"]
-dev     = ["detector"]
+[launch.default]
+nodes = [
+    { name = "detector" },
+    { name = "controller", delay = 1.0, depends_on = "detector" },
+]
+
+[launch.prod]
+nodes = [
+    { name = "detector", wait_ready = true, params = { model = "yolo.pt" } },
+    { name = "controller", delay = 2.0, depends_on = "detector" },
+]
 
 [dev]
 hot_reload = true
@@ -132,7 +143,7 @@ namespace = "/my_robot"
 | `[project]` | Workspace name, version, Python version |
 | `[robot]` | Platform, transport (`ros2`), `domain_id` |
 | `[nodes]` | Map of node name → script path (relative to workspace root) |
-| `[launch]` | Named profiles mapping to lists of node names |
+| `[launch.<name>]` | Named pipelines; each has a `nodes` array of step objects |
 | `[dependencies]` | Python packages (checked by `reach doctor`) |
 | `[dev]` | Hot reload toggle and ignore paths |
 | `[ros]` | Global remappings, namespace, per-node args, parameters |
