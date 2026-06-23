@@ -1,226 +1,420 @@
-# Reach
+<div align="center">
+
+```
+██████╗ ███████╗ █████╗  ██████╗██╗  ██╗
+██╔══██╗██╔════╝██╔══██╗██╔════╝██║  ██║
+██████╔╝█████╗  ███████║██║     ███████║
+██╔══██╗██╔══╝  ██╔══██║██║     ██╔══██║
+██║  ██║███████╗██║  ██║╚██████╗██║  ██║
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝
+```
 
 **Make your code reach the robot.**
 
-Reach (ReachPy) is a lightweight toolchain for ROS 2 Python robotics projects. It replaces the usual scatter of `CMakeLists.txt`, `package.xml`, `setup.py`, and XML launch files with a single **`reach.toml`** and a small CLI that runs your nodes with hot reload.
+A Python-native robotics framework built on ROS2.  
+ReachPy does to robotics development what Next.js did to web development.
 
-## Why Reach?
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![ROS2](https://img.shields.io/badge/transport-ROS2-22314E.svg)](https://ros.org/)
+[![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](https://github.com/ascii-robotics/ros-config-reduction/releases)
 
-Traditional ROS 2 workspaces carry a lot of ceremony for what is often a handful of Python scripts. Reach keeps the same ROS 2 runtime (`rclpy`, topics, parameters) but moves configuration and orchestration into one place:
+</div>
 
-| Traditional stack | Reach |
-|-------------------|-------|
-| `package.xml` | `[project]` in `reach.toml` |
-| `setup.py` / install rules | `[nodes]` paths |
-| XML launch files | `[launch.<pipeline>]` |
-| Manual `ros2 run` loops | `reach run` / `reach launch` |
+---
 
-You still source ROS 2 and write normal Python node scripts; Reach handles process management, remappings, and dev-time hot reload.
+## The problem
 
-## Requirements
+ROS workspaces are organized and messy at the same time. Every project requires:
 
-- **Rust** (2021 edition) — to build the `reach` CLI
-- **Python 3.x** — node scripts
-- **ROS 2** (Humble, Iron, or Jazzy) — sourced before running nodes, e.g.:
+- `CMakeLists.txt` — build configuration
+- `package.xml` — package metadata and dependencies
+- `setup.py` — Python package installation
+- XML launch files — node orchestration
+- `source devel/setup.bash` — invisible state that silently breaks things
+- `colcon build --symlink-install` — every time you change a single line
 
-  ```bash
-  source /opt/ros/humble/setup.bash
-  ```
+That is four files saying the same things in four different formats before you have written a single line of robot logic. ReachPy replaces all of it with one file.
 
-## Install
+---
 
-From the repository root:
+## Installation
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) 1.75+
+- ROS2 Humble or newer
+- Python 3.10+
+
+### Build from source
 
 ```bash
+git clone https://github.com/ascii-robotics/ros-config-reduction.git
+cd ros-config-reduction
 cargo build --release
+sudo cp target/release/reach /usr/local/bin/reach
 ```
 
-The binary is `target/release/reach`. Add it to your `PATH`, or install with:
+---
 
-```bash
-cargo install --path crates/reach-cli
-```
+## reach.toml
 
-## Quick start
-
-```bash
-# Create a new workspace
-reach create my-robot
-cd my-robot
-
-# Check your environment and config
-reach doctor
-reach config
-
-# Run the default profile (with hot reload)
-reach run
-```
-
-`reach create` scaffolds `reach.toml`, `src/`, `config/`, and `models/`.
-
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `reach` | Show help |
-| `reach create <name>` | Create a new ReachPy workspace |
-| `reach config` | Print resolved `reach.toml` |
-| `reach doctor` | Diagnose ROS 2, Python, workspace, and nodes |
-| `reach run [profile\|node...]` | Run nodes with hot reload |
-| `reach launch <pipeline>` | Run a launch pipeline (ordered, with delays/deps) |
-| `reach build` | *(coming soon)* |
-
-### `reach run`
-
-Starts one or more nodes and watches `.py` files for changes.
-
-- **No args** — runs the `default` launch profile, or all nodes if no `default` profile is defined
-- **One arg** — if it matches a launch profile name, runs that profile; if it matches a node name, runs that node
-- **Multiple args** — treats each arg as a node name
-
-```bash
-reach run                  # default profile
-reach run dev              # profile named "dev"
-reach run detector         # single node
-reach run detector tracker # multiple nodes
-```
-
-### `reach launch`
-
-Runs a named pipeline from `reach.toml` **in order**, honoring:
-
-- **`delay`** — wait N seconds before starting a node
-- **`depends_on`** — wait until another node in the pipeline is running
-- **`wait_ready`** — block until the node appears on the ROS 2 graph (`ros2 node list`)
-- **`params`** — per-node ROS parameters (`--ros-args -p key:=value`)
-
-Use `reach run` for everyday dev (parallel start + hot reload). Use `reach launch` when startup order and readiness gates matter.
-
-## `reach.toml` reference
-
-A minimal workspace:
+One file. Replaces everything.
 
 ```toml
 [project]
 name = "my-robot"
 version = "0.1.0"
 python = "3.11"
+description = "A ReachPy workspace"
 
 [robot]
-platform = "generic"
+platform = "ur5"
 transport = "ros2"
 domain_id = 0
 
 [nodes]
-detector   = "src/detector.py"
-controller = "src/controller.py"
+detector    = "src/detector.py"
+controller  = "src/controller.py"
+logger      = "src/logger.py"
 
 [launch.default]
 nodes = [
-    { name = "detector" },
-    { name = "controller", delay = 1.0, depends_on = "detector" },
+    { name = "detector",   delay = 0.0, wait_ready = true, params = { model = "yolo.pt" } },
+    { name = "controller", delay = 2.0, depends_on = "detector" },
 ]
 
 [launch.prod]
 nodes = [
-    { name = "detector", wait_ready = true, params = { model = "yolo.pt" } },
+    { name = "detector",   delay = 0.0, wait_ready = true, params = { model = "yolo.pt", threshold = "0.9" } },
     { name = "controller", delay = 2.0, depends_on = "detector" },
+    { name = "logger",     delay = 0.5 },
 ]
+
+[launch.camera_only]
+nodes = [
+    { name = "detector", params = { model = "yolo.pt" } },
+]
+
+[dependencies]
+opencv = "4.8"
+torch  = "2.0"
 
 [dev]
 hot_reload = true
 hot_reload_ignore = ["config/", "models/"]
 
-[ros]
-remappings = { "/camera/image" = "/robot/camera/image" }
-namespace = "/my_robot"
+# Advanced ROS2 escape hatch
+# [ros]
+# namespace = "/robot1"
+# [ros.remappings]
+# "/camera/raw" = "/camera/compressed"
 ```
 
-### Sections
+### What reach.toml replaces
 
-| Section | Purpose |
-|---------|---------|
-| `[project]` | Workspace name, version, Python version |
-| `[robot]` | Platform, transport (`ros2`), `domain_id` |
-| `[nodes]` | Map of node name → script path (relative to workspace root) |
-| `[launch.<name>]` | Named pipelines; each has a `nodes` array of step objects |
-| `[dependencies]` | Python packages (checked by `reach doctor`) |
-| `[dev]` | Hot reload toggle and ignore paths |
-| `[ros]` | Global remappings, namespace, per-node args, parameters |
+| reach.toml | Replaces |
+|---|---|
+| `[project]` | `package.xml` metadata + `setup.py` |
+| `[nodes]` | `CMakeLists.txt` targets + entry points |
+| `[launch.*]` | XML launch files — entirely |
+| `[dependencies]` | `package.xml` exec_depend entries |
+| `[robot] domain_id` | `ROS_DOMAIN_ID` env var |
+| `[ros.remappings]` | `<remap>` tags in XML launch files |
 
-Config is discovered by walking up from the current directory until `reach.toml` is found.
+---
 
-## Writing nodes
+## Writing nodes for ReachPy
 
-Node scripts are plain Python. Reach embeds a launcher that:
-
-1. Initializes `rclpy`
-2. Imports your script as a module
-3. Spins a `@node` if one is registered (future); otherwise runs your script’s top-level code
-
-Example (`src/example.py`):
+Your nodes are plain Python files. The only requirement is exposing `__reachpy_node__` so the launcher can spin them:
 
 ```python
-import time
+# src/detector.py
+# hot-reload-off  ← add this to disable hot reload for this node
 
-print("[example] Node started")
-while True:
-    time.sleep(1)
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+
+class DetectorNode(Node):
+    def __init__(self):
+        super().__init__('detector')
+        self.sub = self.create_subscription(Image, '/camera/image_raw', self.callback, 10)
+        self.pub = self.create_publisher(String, '/detections', 10)
+        self.timer = self.create_timer(0.033, self.detect)
+
+    def callback(self, msg):
+        self.latest = msg
+
+    def detect(self):
+        # your logic here
+        pass
+
+# ReachPy picks this up and spins it
+node = DetectorNode()
+__reachpy_node__ = node
 ```
 
-For ROS 2 nodes, use `rclpy` as usual inside the script.
+No `rclpy.init()`. No `rclpy.spin()`. No `rclpy.shutdown()`. ReachPy handles all of that.
 
-## Hot reload
+---
 
-When `[dev] hot_reload = true` (default), Reach watches the workspace for `.py` changes and restarts the affected node(s).
+## Commands
 
-- Add `# hot-reload-off` in the first 5 lines of a file to skip reload for that node
-- Paths in `hot_reload_ignore` (e.g. `config/`, `models/`) are not watched
-- Shared modules outside a node’s directory reload all eligible running nodes
+### `reach create <name>`
 
-Press **Ctrl+C** to stop all nodes cleanly.
+Scaffold a new workspace.
 
-## Workspace layout
+```bash
+reach create my-robot
+cd my-robot
+```
 
 ```
 my-robot/
-├── reach.toml      # All project config
-├── src/            # Node scripts
-├── config/         # Robot config (ignored by hot reload)
-├── models/         # ML weights (ignored by hot reload)
-└── launch/         # Reserved for future use
+├── reach.toml        ← your entire config lives here
+├── src/
+│   └── example.py   ← example node
+├── config/           ← robot config (not hot-reloaded)
+├── models/           ← ML models (not hot-reloaded)
+└── bags/             ← rosbag recordings
 ```
 
-## Repository structure
+---
 
-```
-.
-├── Cargo.toml              # Workspace root
-├── crates/
-│   ├── reach-cli/          # `reach` binary (create, run, launch, doctor)
-│   │   └── python/
-│   │       └── launcher.py # Embedded rclpy bootstrap (not user-facing)
-│   └── reachpy-config/     # reach.toml parser and validation
-└── README.md
-```
+### `reach run`
 
-## Development
+Run nodes with hot reload. Save a file, the node updates live. No rebuild. No restart.
 
 ```bash
-# Build
-cargo build
-
-# Run tests (config crate)
-cargo test -p reachpy-config
-
-# Run CLI from workspace
-cargo run -p reach-cli -- doctor
+reach run                     # runs [launch.default], or all nodes
+reach run talker              # run a single node by name
+reach run talker listener     # run specific nodes together
+reach run camera_only         # run a named launch pipeline
 ```
 
-## Status
+Hot reload is always on. To disable it for a specific node, add this as the **first line** of that file:
 
-Reach is early-stage. `reach build` and deeper ROS package integration are planned. The config format and CLI are actively evolving.
+```python
+# hot-reload-off
+```
 
-## License
+ReachPy reads this before deciding whether to reload. The rest of your code is untouched.
 
-See repository defaults; confirm license file if present before redistribution.
+---
+
+### `reach launch <pipeline>`
+
+Run a named launch pipeline with ordering, delays, dependencies, and per-node parameters. Hot reload enabled.
+
+```bash
+reach launch default
+reach launch prod
+reach launch camera_only
+```
+
+Pipeline node options:
+
+| option | description |
+|---|---|
+| `name` | node name from `[nodes]` — required |
+| `delay` | seconds to wait before starting this node |
+| `depends_on` | wait for another node to be running first |
+| `wait_ready` | block until node appears on ROS2 graph |
+| `params` | ROS2 params passed as `--ros-args -p key:=value` |
+
+---
+
+### `reach build`
+
+Generate a valid ROS2 package from `reach.toml` and run `colcon build`. Run this every time you want your workspace to be a proper ROS2 package — discoverable via `ros2 run`, dependable by other packages.
+
+```bash
+reach build
+```
+
+Generates `CMakeLists.txt`, `package.xml`, `setup.py` invisibly in `.reach/`. You never touch them. After build:
+
+```bash
+source .reach/install/setup.bash
+ros2 run my-robot detector    # works
+```
+
+---
+
+### `reach bags`
+
+Rosbag management with workspace awareness. Bags stored in `bags/` with auto-generated timestamps.
+
+```bash
+# Recording
+reach bags record                     # record all topics
+reach bags record /camera /chatter    # record specific topics
+reach bags record --profile default   # record topics from a launch profile
+
+# Playback
+reach bags play bags/bag_1234567890   # play back a recording
+reach bags play bags/bag_1234567890 --loop          # loop
+reach bags play bags/bag_1234567890 --rate 0.5      # half speed
+
+# Management
+reach bags list                       # list all recordings with sizes
+```
+
+---
+
+### `reach trace`
+
+Data tracing and relationship tracing. Captures message flow, timing, and node relationships while your system runs. Stored in `.reach/traces/`.
+
+```bash
+reach trace                    # run system with tracing enabled
+reach trace show               # show last trace session
+reach trace show --node talker # filter by node
+reach trace clear              # remove all traces
+```
+
+Example output:
+
+```
+  reach trace — session analysis
+
+  session: 1736934721
+
+  Topic Activity
+  ────────────────────────────────────────────
+  ◈ /camera/image_raw    30.0 Hz
+  ◈ /vision/detections   29.8 Hz
+  ◈ /robot/cmd_vel       10.0 Hz
+
+  Node Relationships
+  ────────────────────────────────────────────
+  [camera] → /camera/image_raw → [detector]
+  [detector] → /vision/detections → [controller]
+  [controller] → /robot/cmd_vel → robot
+```
+
+---
+
+### `reach config`
+
+Validate and display your resolved `reach.toml`.
+
+```bash
+reach config
+```
+
+```
+  ✓ reach.toml resolved successfully
+
+  ────────────────────────────────────────────
+  Project:     my-robot v0.1.0
+  Python:      3.11
+  Platform:    ur5
+  Transport:   ros2
+  Nodes:       3
+    - detector   → src/detector.py
+    - controller → src/controller.py
+    - logger     → src/logger.py
+  Pipelines:
+    - default → [detector, controller]
+    - prod    → [detector, controller, logger]
+  Hot reload:  true
+  ────────────────────────────────────────────
+```
+
+---
+
+### `reach doctor`
+
+Diagnose your entire workspace before you try to run anything.
+
+```bash
+reach doctor
+```
+
+Checks:
+- ROS2 sourced and distro detected
+- rclpy importable
+- Python version matches `reach.toml`
+- `reach.toml` valid
+- All node scripts exist and have no syntax errors
+- `# hot-reload-off` flags detected
+- Launch pipeline references are valid
+- Dependencies installed
+
+---
+
+## How it works
+
+```
+reach run / reach launch
+    → reads reach.toml (Rust)
+    → resolves launch profile or pipeline
+    → writes embedded launcher.py to /tmp (Rust)
+    → spawns python3 launcher.py <script> <name> --ros-args ... (Rust)
+    → injects ROS_DOMAIN_ID, remappings, params (Rust)
+    → file watcher detects .py changes → restarts affected node (Rust)
+    → launcher.py bootstraps rclpy → imports script → spins node (Python)
+
+reach build
+    → reads reach.toml
+    → generates CMakeLists.txt, package.xml, setup.py in .reach/
+    → runs colcon build
+    → workspace becomes a valid ROS2 package
+
+reach trace
+    → runs nodes with REACHPY_TRACE env vars injected
+    → background thread captures topic Hz and node relationships via ros2 CLI
+    → stores structured JSON in .reach/traces/
+    → reach trace show renders the session
+```
+
+The `reach` binary is self-contained. `launcher.py` is embedded at compile time via `include_str!` — no loose files, no installation steps beyond copying the binary.
+
+---
+
+## Project structure
+
+```
+ros-config-reduction/
+├── Cargo.toml                       ← workspace root
+└── crates/
+    ├── reachpy-config/              ← config library
+    │   ├── Cargo.toml
+    │   └── src/lib.rs
+    └── reach-cli/                   ← the reach binary
+        ├── Cargo.toml
+        ├── python/
+        │   └── launcher.py          ← embedded into binary at compile time
+        └── src/main.rs
+```
+
+---
+
+## Roadmap
+
+- [x] `reach create` — workspace scaffolding
+- [x] `reach config` — config validation and display
+- [x] `reach run` — flat node launcher with hot reload
+- [x] `reach launch` — ordered pipeline launcher with hot reload
+- [x] `reach doctor` — workspace diagnostics
+- [x] `reach build` — ROS2 package generation
+- [x] `reach bags` — rosbag recording and playback
+- [x] `reach trace` — data and relationship tracing
+- [x] `# hot-reload-off` — per-node opt out
+- [ ] ReachPy Python framework — `@node`, `Topic[T]`, `Message` types
+- [ ] Zenoh transport layer — ROS2-free operation
+- [ ] `reach deploy` — deploy to robot fleet
+
+---
+
+## Built by
+
+[ASCII Robotics](https://ascii-robotics.com) — Fukuoka, Japan  
+Kyushu Institute of Technology
+
+---
+
+*"If it doesn't directly express robot behavior, ReachPy handles it invisibly."*
