@@ -17,7 +17,7 @@ ReachPy does to robotics development what Next.js did to web development.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![ROS2](https://img.shields.io/badge/transport-ROS2-22314E.svg)](https://ros.org/)
-[![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](https://github.com/ascii-robotics/ros-config-reduction/releases)
+[![Version](https://img.shields.io/badge/version-v1.1.0-blue.svg)](https://github.com/ascii-robotics/ros-config-reduction/releases)
 
 </div>
 
